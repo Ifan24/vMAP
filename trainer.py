@@ -13,6 +13,7 @@ class Trainer:
         self.hidden_feature_size = cfg.hidden_feature_size #32 for obj  # 256 for iMAP, 128 for seperate bg
         self.obj_scale = cfg.obj_scale # 10 for bg and iMAP
         self.n_unidir_funcs = cfg.n_unidir_funcs
+        # embedding size after positional encoding
         self.emb_size1 = 21*(3+1)+3
         self.emb_size2 = 21*(5+1)+3 - self.emb_size1
 
@@ -32,24 +33,38 @@ class Trainer:
         self.fc_occ_map.apply(model.init_weights).to(self.device)
         self.pe = embedding.UniDirsEmbed(max_deg=self.n_unidir_funcs, scale=self.obj_scale).to(self.device)
 
+    # generates meshes for evaluation given object bounds.
     def meshing(self, bound, obj_center, grid_dim=256):
+        # Estimate occupancy range based on bound extent
         occ_range = [-1., 1.]
         range_dist = occ_range[1] - occ_range[0]
-        scene_scale_np = bound.extent / (range_dist * self.bound_extent)
+        scene_scale_np = bound.extent / (range_dist * self.bound_extent) # Rescale to fit in unit cube
+        
+        # Convert scale to torch tensor
         scene_scale = torch.from_numpy(scene_scale_np).float().to(self.device)
+        
+        # Create 4x4 transform matrix from bound center and rotation
         transform_np = np.eye(4, dtype=np.float32)
         transform_np[:3, 3] = bound.center
         transform_np[:3, :3] = bound.R
+        
+        # Invert transform to go from world -> object space
         # transform_np = np.linalg.inv(transform_np)  #
         transform = torch.from_numpy(transform_np).to(self.device)
+        
+        # Generate grid of 3D points to evaluate
         grid_pc = render_rays.make_3D_grid(occ_range=occ_range, dim=grid_dim, device=self.device,
                                            scale=scene_scale, transform=transform).view(-1, 3)
-        grid_pc -= obj_center.to(grid_pc.device)
+        grid_pc -= obj_center.to(grid_pc.device) # Center on object
+        
+        # Evaluate occupancy and color on grid
         ret = self.eval_points(grid_pc)
         if ret is None:
             return None
 
         occ, _ = ret
+        
+        # Marching cubes to generate mesh from occupancy
         mesh = vis.marching_cubes(occ.view(grid_dim, grid_dim, grid_dim).cpu().numpy())
         if mesh is None:
             print("marching cube failed")
@@ -63,11 +78,14 @@ class Trainer:
         mesh.apply_scale(scene_scale_np)
         mesh.apply_transform(transform_np)
 
+        # Evaluate color on mesh vertices
         vertices_pts = torch.from_numpy(np.array(mesh.vertices)).float().to(self.device)
         ret = self.eval_points(vertices_pts)
         if ret is None:
             return None
         _, color = ret
+        
+        # Update mesh with evaluated color
         mesh_color = color * 255
         vertex_colors = mesh_color.detach().squeeze(0).cpu().numpy().astype(np.uint8)
         mesh.visual.vertex_colors = vertex_colors

@@ -10,6 +10,7 @@ from torchvision import transforms
 import image_transforms
 import open3d
 import time
+import matplotlib.pyplot as plt
 
 def next_live_data(track_to_map_IDT, inited):
     while True:
@@ -61,6 +62,8 @@ def init_loader(cfg, multi_worker=True):
     return dataloader
 
 class Replica(Dataset):
+    # No need to do object association and initilization with point cloud (box_filter), 
+    # because the dataset already provided the GT object mask
     def __init__(self, cfg):
         self.imap_mode = cfg.imap_mode
         self.root_dir = cfg.dataset_dir
@@ -73,6 +76,7 @@ class Replica(Dataset):
         # background semantic classes: undefined--1, undefined-0 beam-5 blinds-12 curtain-30 ceiling-31 floor-40 pillar-60 vent-92 wall-93 wall-plug-95 window-97 rug-98
         self.background_cls_list = [5,12,30,31,40,60,92,93,95,97,98,79]
         # Not sure: door-37 handrail-43 lamp-47 pipe-62 rack-66 shower-stall-73 stair-77 switch-79 wall-cabinet-94 picture-59
+        # ??? why hand-crafted so many object as background
         self.bbox_scale = 0.2  # 1 #1.5 0.9== s=1/9, s=0.2
 
     def __len__(self):
@@ -98,26 +102,39 @@ class Replica(Dataset):
             obj_ = np.zeros_like(obj)
             inst_list = []
             batch_masks = []
+            # Loop through each unique instance ID in the instance segmentation map
+            # each pixel has an instance id
             for inst_id in np.unique(inst):
                 inst_mask = inst == inst_id
                 # if np.sum(inst_mask) <= 2000: # too small    20  400
                 #     continue
                 sem_cls = np.unique(obj[inst_mask])  # sem label, only interested obj
                 assert sem_cls.shape[0] != 0
+                
+                # If the semantic class is part of the background classes, continue to the next instance
                 if sem_cls in self.background_cls_list:
                     continue
+                
+                # If the instance is not part of the background, add the mask and instance ID to the corresponding lists
                 obj_mask = inst == inst_id
                 batch_masks.append(obj_mask)
                 inst_list.append(inst_id)
+                
+            # If there are instance masks, compute 2D bounding boxes for each instance
             if len(batch_masks) > 0:
                 batch_masks = torch.from_numpy(np.stack(batch_masks))
                 cmins, cmaxs, rmins, rmaxs = get_bbox2d_batch(batch_masks)
 
+                # Loop through each instance mask
                 for i in range(batch_masks.shape[0]):
                     w = rmaxs[i] - rmins[i]
                     h = cmaxs[i] - cmins[i]
+                    
+                    # If the bounding box is too small, continue to the next instance (why skip?)
                     if w <= 10 or h <= 10:  # too small   todo
                         continue
+                        
+                    # Enlarge the bounding box and update the `bbox_dict` and `obj_` map
                     bbox_enlarged = enlarge_bbox([rmins[i], cmins[i], rmaxs[i], cmaxs[i]], scale=bbox_scale,
                                                  w=obj.shape[1], h=obj.shape[0])
                     # inst_list.append(inst_id)
@@ -126,10 +143,12 @@ class Replica(Dataset):
                     # bbox_dict.update({int(inst_id): torch.from_numpy(np.array(bbox_enlarged).reshape(-1))}) # batch format
                     bbox_dict.update({inst_id: torch.from_numpy(np.array(
                         [bbox_enlarged[1], bbox_enlarged[3], bbox_enlarged[0], bbox_enlarged[2]]))})  # bbox order
-
+            
+            # Update the instance segmentation map to set all background pixels to 0
             inst[obj_ == 0] = 0  # for background
             obj = inst
 
+        # Add a bounding box that covers the entire image to `bbox_dict` with a key of 0
         bbox_dict.update({0: torch.from_numpy(np.array([int(0), int(obj.shape[0]), 0, int(obj.shape[1])]))})  # bbox order
 
         T = self.Twc[idx]   # could change to ORB-SLAM pose or else
@@ -145,6 +164,7 @@ class Replica(Dataset):
         if self.depth_transform:
             sample["depth"] = self.depth_transform(sample["depth"])
 
+        # Return the dictionary containing all data for the current frame
         return sample
 
 class ScanNet(Dataset):
@@ -207,52 +227,74 @@ class ScanNet(Dataset):
 
     def __getitem__(self, index):
         bbox_scale = self.bbox_scale
+        
+        # Loading the paths to the color, depth, instance, and semantic images
         color_path = self.color_paths[index]
         depth_path = self.depth_paths[index]
         inst_path = self.inst_paths[index]
         sem_path = self.sem_paths[index]
+        
+        # Loading the color data and converting it to RGB
         color_data = cv2.imread(color_path).astype(np.uint8)
         color_data = cv2.cvtColor(color_data, cv2.COLOR_BGR2RGB)
+        
+        # Loading the depth data and replacing any NaN values with 0
         depth_data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
         depth_data = np.nan_to_num(depth_data, nan=0.)
         T = None
         if self.poses is not None:
             T = self.poses[index]
+            # If any element in the transformation matrix is infinity, recursively call the next index
+            # skip current frame if pose ill-defined
             if np.any(np.isinf(T)):
                 if index + 1 == self.__len__():
                     print("pose inf!")
                     return None
                 return self.__getitem__(index + 1)
 
+        # Resizing the color data to match the size of the depth data
         H, W = depth_data.shape
         color_data = cv2.resize(color_data, (W, H), interpolation=cv2.INTER_LINEAR)
+        
         if self.edge:
             edge = self.edge # crop image edge, there are invalid value on the edge of the color image
             color_data = color_data[edge:-edge, edge:-edge]
             depth_data = depth_data[edge:-edge, edge:-edge]
+            
+        # Applying transformations to the depth data
         if self.depth_transform:
             depth_data = self.depth_transform(depth_data)
+           
+        # Initializing a dictionary to store bounding box data
         bbox_dict = {}
+        
+        # If imap_mode is set to True, creating an empty instance data array
         if self.imap_mode:
             inst_data = np.zeros_like(depth_data).astype(np.int32)
+        
+        # Otherwise, loading the instance and semantic data, and creating object masks
         else:
             inst_data = cv2.imread(inst_path, cv2.IMREAD_UNCHANGED)
             inst_data = cv2.resize(inst_data, (W, H), interpolation=cv2.INTER_NEAREST).astype(np.int32)
             sem_data = cv2.imread(sem_path, cv2.IMREAD_UNCHANGED)#.astype(np.int32)
             sem_data = cv2.resize(sem_data, (W, H), interpolation=cv2.INTER_NEAREST)
+            # crop to the edge
             if self.edge:
                 edge = self.edge
                 inst_data = inst_data[edge:-edge, edge:-edge]
                 sem_data = sem_data[edge:-edge, edge:-edge]
+                
+            # Shifting the instance data by one to reserve 0 for the background
             inst_data += 1  # shift from 0->1 , 0 is for background
 
-            # box filter
+            # Applying the box filter for object tracking and filtering
             track_start = time.time()
             masks = []
             classes = []
             # convert to list of arrays
             obj_ids = np.unique(inst_data)
             for obj_id in obj_ids:
+                # A mask is created where the inst_data is equal to the current object ID.
                 mask = inst_data == obj_id
                 sem_cls = np.unique(sem_data[mask])
                 if sem_cls in self.background_cls_list:
@@ -260,9 +302,14 @@ class ScanNet(Dataset):
                     continue
                 masks.append(mask)
                 classes.append(obj_id)
+            
+            # Applying inverse transformation to the transformation matrix
             T_CW = np.linalg.inv(T)
+            
+            # performs object association/tracking and updates the inst_data to reflect this
             inst_data = box_filter(masks, classes, depth_data, self.inst_dict, self.intrinsic_open3d, T_CW, min_pixels=self.min_pixels)
 
+            # Obtaining the bounding box for each unique object
             merged_obj_ids = np.unique(inst_data)
             for obj_id in merged_obj_ids:
                 mask = inst_data == obj_id
@@ -278,15 +325,20 @@ class ScanNet(Dataset):
             cv2.waitKey(1)
             print("frame {} track time {}".format(index, bbox_time-track_start))
 
+        # Adding the bounding box for the background
         bbox_dict.update({0: torch.from_numpy(np.array([int(0), int(inst_data.shape[1]), 0, int(inst_data.shape[0])]))})  # bbox order
+        
         # wrap data to frame dict
+        # Creating a dictionary to store all the data
         T_obj = np.identity(4)
         sample = {"image": color_data.transpose(1,0,2), "depth": depth_data.transpose(1,0), "T": T, "T_obj": T_obj}
+        
         if color_data is None or depth_data is None:
             print(color_path)
             print(depth_path)
             raise ValueError
 
+        # Adding the instance data and bounding box dictionary to the sample
         sample.update({"obj": inst_data.transpose(1,0)})
         sample.update({"bbox_dict": bbox_dict})
         return sample

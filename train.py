@@ -10,6 +10,9 @@ import argparse
 from cfg import Config
 import shutil
 
+# TODO: fix random seed?
+
+
 if __name__ == "__main__":
     #############################################
     # init config
@@ -18,19 +21,15 @@ if __name__ == "__main__":
 
     # setting params
     parser = argparse.ArgumentParser(description='Model training for single GPU')
-    parser.add_argument('--logdir', default='./logs/debug',
-                        type=str)
-    parser.add_argument('--config',
-                        default='./configs/Replica/config_replica_room0_vMAP.json',
-                        type=str)
-    parser.add_argument('--save_ckpt',
-                        default=False,
-                        type=bool)
+    parser.add_argument('--logdir', default='./logs/debug', type=str)
+    parser.add_argument('--config', default='./configs/Replica/config_replica_room0_vMAP.json', type=str)
+    parser.add_argument('--save_ckpt', default=False, type=bool)
     args = parser.parse_args()
 
     log_dir = args.logdir
     config_file = args.config
     save_ckpt = args.save_ckpt
+    
     os.makedirs(log_dir, exist_ok=True)  # saving logs
     shutil.copy(config_file, log_dir)
     cfg = Config(config_file)       # config params
@@ -38,6 +37,7 @@ if __name__ == "__main__":
     n_sample_per_step_bg = cfg.n_per_optim_bg
 
     # param for vis
+    # Set up 3D visualization tool using Open3D
     vis3d = open3d.visualization.Visualizer()
     vis3d.create_window(window_name="3D mesh vis",
                         width=cfg.W,
@@ -57,7 +57,11 @@ if __name__ == "__main__":
         cy=cfg.cy)
 
     # init obj_dict
+    # Initialize dictionaries for objects and visualizations
     obj_dict = {}   # only objs
+    # obj_dict = {
+    #     obj_id : obj_k<sceneObject>
+    # }
     vis_dict = {}   # including bg
 
     # init for training
@@ -89,9 +93,11 @@ if __name__ == "__main__":
 
 
     # init vmap
+    # all the objects' parameters
     fc_models, pe_models = [], []
     scene_bg = None
 
+    # Main training loop
     for frame_id in tqdm(range(dataset_len)):
         print("*********************************************")
         # get new frame data
@@ -104,27 +110,40 @@ if __name__ == "__main__":
 
         if sample is not None:  # new frame
             last_frame_time = time.time()
+            # process the sample data and update the object dictionaries
             with performance_measure(f"Appending data"):
+                # add data to device
                 rgb = sample["image"].to(cfg.data_device)
                 depth = sample["depth"].to(cfg.data_device)
                 twc = sample["T"].to(cfg.data_device)
+                # get bbox
                 bbox_dict = sample["bbox_dict"]
+                
+                # If the sample contains a frame_id, use it; otherwise use the current frame id
+                # Only Replica object has frame_id, it is just the index of the frame
                 if "frame_id" in sample.keys():
                     live_frame_id = sample["frame_id"]
                 else:
                     live_frame_id = frame_id
+                
+                # If not in live mode, get the instance segmentation map and the object ids in that map
                 if not cfg.live_mode:
                     inst = sample["obj"].to(cfg.data_device)
                     obj_ids = torch.unique(inst)
+                # TODO: why is live mode different?
                 else:
                     inst_data_dict = sample["obj"]
                     obj_ids = inst_data_dict.keys()
+                    
+                # Iterate over each object id
                 # append new frame info to objs in current view
                 for obj_id in obj_ids:
-                    if obj_id == -1:    # unsured area
+                    # unsured area has id of -1, background has id of 0
+                    if obj_id == -1:  
                         continue
                     obj_id = int(obj_id)
-                    # convert inst mask to state
+                    
+                    # Convert instance segmentation map to state (0 for background, 1 for object, 2 for unsure)
                     if not cfg.live_mode:
                         state = torch.zeros_like(inst, dtype=torch.uint8, device=cfg.data_device)
                         state[inst == obj_id] = 1
@@ -135,20 +154,37 @@ if __name__ == "__main__":
                         state = torch.zeros_like(inst_mask, dtype=torch.uint8, device=cfg.data_device)
                         state[inst_mask == obj_id] = 1
                         state[inst_mask == -1] = 2
+                        
+                    # Get bounding box for the current object
                     bbox = bbox_dict[obj_id]
+                    
+                    # If object already exists in the visualization dictionary, append a new keyframe to the object
+                    # so if the keyframe contains 5 objects it would be appended 5 times (memory inefficient?)
+                    # each object has a fixed size keyframe buffer, but it would only store the reference of the keyframe,
+                    # but if each keyframe is linked to at least one object, it would be freed from memory, 
+                    # so if the keyframe keeps growing there might be a problem
+                    
+                    # Otherwise, initialize a new scene object
                     if obj_id in vis_dict.keys():
                         scene_obj = vis_dict[obj_id]
                         scene_obj.append_keyframe(rgb, depth, state, bbox, twc, live_frame_id)
+                        
                     else: # init scene_obj
                         if len(obj_dict.keys()) >= cfg.max_n_models:
                             print("models full!!!! current num ", len(obj_dict.keys()))
                             continue
                         print("init new obj ", obj_id)
+                        
+                        # If the object id is 0 and background processing is enabled, initialize a background scene object
+                        # Otherwise, initialize a regular scene object
                         if cfg.do_bg and obj_id == 0:   # todo param
+                            # init a new occupancy grid and add it to the optimiser
                             scene_bg = sceneObject(cfg, obj_id, rgb, depth, state, bbox, twc, live_frame_id)
                             # scene_bg.init_obj_center(intrinsic_open3d, depth, state, twc)
                             optimiser.add_param_group({"params": scene_bg.trainer.fc_occ_map.parameters(), "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay})
                             optimiser.add_param_group({"params": scene_bg.trainer.pe.parameters(), "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay})
+                            scene_bg.trainer.pe = torch.compile(scene_bg.trainer.pe)
+                            scene_bg.trainer.fc_occ_map = torch.compile(scene_bg.trainer.fc_occ_map)
                             vis_dict.update({obj_id: scene_bg})
                         else:
                             scene_obj = sceneObject(cfg, obj_id, rgb, depth, state, bbox, twc, live_frame_id)
@@ -158,10 +194,15 @@ if __name__ == "__main__":
                             # params = [scene_obj.trainer.fc_occ_map.parameters(), scene_obj.trainer.pe.parameters()]
                             optimiser.add_param_group({"params": scene_obj.trainer.fc_occ_map.parameters(), "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay})
                             optimiser.add_param_group({"params": scene_obj.trainer.pe.parameters(), "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay})
+                            scene_obj.trainer.pe = torch.compile(scene_obj.trainer.pe)
+                            scene_obj.trainer.fc_occ_map = torch.compile(scene_obj.trainer.fc_occ_map)
+                            
+                            # If training strategy is vmap, add the models to the list of models
                             if cfg.training_strategy == "vmap":
                                 update_vmap_model = True
                                 fc_models.append(obj_dict[obj_id].trainer.fc_occ_map)
                                 pe_models.append(obj_dict[obj_id].trainer.pe)
+                                
 
                         # ###################################
                         # # measure trainable params in total
@@ -178,6 +219,8 @@ if __name__ == "__main__":
         # dynamically add vmap
         with performance_measure(f"add vmap"):
             if cfg.training_strategy == "vmap" and update_vmap_model == True:
+                # Call the update_vmap utility function to create a new vmap model, parameters, and buffers for the fully connected (fc) models
+                # Prepares a list of torch.nn.Modules for ensembling with vmap().
                 fc_model, fc_param, fc_buffer = utils.update_vmap(fc_models, optimiser)
                 pe_model, pe_param, pe_buffer = utils.update_vmap(pe_models, optimiser)
                 update_vmap_model = False
@@ -192,11 +235,17 @@ if __name__ == "__main__":
         Batch_N_input_pcs = []
         Batch_N_sampled_z = []
 
+        # Training step
         with performance_measure(f"Sampling over {len(obj_dict.keys())} objects,"):
+            # sample over background
             if cfg.do_bg and scene_bg is not None:
+                
+                # Get training samples from the background scene
                 gt_rgb, gt_depth, valid_depth_mask, obj_mask, input_pcs, sampled_z \
                     = scene_bg.get_training_samples(cfg.n_iter_per_frame * cfg.win_size_bg, cfg.n_samples_per_frame_bg,
                                                     cam_info.rays_dir_cache)
+                                                    
+                # Reshape these samples into desired shapes for further processing                                    
                 bg_gt_depth = gt_depth.reshape([gt_depth.shape[0] * gt_depth.shape[1]])
                 bg_gt_rgb = gt_rgb.reshape([gt_rgb.shape[0] * gt_rgb.shape[1], gt_rgb.shape[2]])
                 bg_valid_depth_mask = valid_depth_mask
@@ -204,11 +253,15 @@ if __name__ == "__main__":
                 bg_input_pcs = input_pcs.reshape(
                     [input_pcs.shape[0] * input_pcs.shape[1], input_pcs.shape[2], input_pcs.shape[3]])
                 bg_sampled_z = sampled_z.reshape([sampled_z.shape[0] * sampled_z.shape[1], sampled_z.shape[2]])
-
+            
+            # Loop over each object in the dictionary (except the background object)
             for obj_id, obj_k in obj_dict.items():
+                # Get training samples for each object
                 gt_rgb, gt_depth, valid_depth_mask, obj_mask, input_pcs, sampled_z \
                     = obj_k.get_training_samples(cfg.n_iter_per_frame * cfg.win_size, cfg.n_samples_per_frame,
                                                  cam_info.rays_dir_cache)
+                                                 
+                # Merge the first two dimensions of each training sample to prepare them for batch training                         
                 # merge first two dims, sample_per_frame*num_per_frame
                 Batch_N_gt_depth.append(gt_depth.reshape([gt_depth.shape[0] * gt_depth.shape[1]]))
                 Batch_N_gt_rgb.append(gt_rgb.reshape([gt_rgb.shape[0] * gt_rgb.shape[1], gt_rgb.shape[2]]))
@@ -216,34 +269,6 @@ if __name__ == "__main__":
                 Batch_N_obj_mask.append(obj_mask)
                 Batch_N_input_pcs.append(input_pcs.reshape([input_pcs.shape[0] * input_pcs.shape[1], input_pcs.shape[2], input_pcs.shape[3]]))
                 Batch_N_sampled_z.append(sampled_z.reshape([sampled_z.shape[0] * sampled_z.shape[1], sampled_z.shape[2]]))
-
-                # # vis sampled points in open3D
-                # # sampled pcs
-                # pc = open3d.geometry.PointCloud()
-                # pc.points = open3d.utility.Vector3dVector(input_pcs.cpu().numpy().reshape(-1,3))
-                # open3d.visualization.draw_geometries([pc])
-                # rgb_np = rgb.cpu().numpy().astype(np.uint8).transpose(1,0,2)
-                # # print("rgb ", rgb_np.shape)
-                # # print(rgb_np)
-                # # cv2.imshow("rgb", rgb_np)
-                # # cv2.waitKey(1)
-                # depth_np = depth.cpu().numpy().astype(np.float32).transpose(1,0)
-                # twc_np = twc.cpu().numpy()
-                # rgbd = open3d.geometry.RGBDImage.create_from_color_and_depth(
-                #     open3d.geometry.Image(rgb_np),
-                #     open3d.geometry.Image(depth_np),
-                #     depth_trunc=max_depth,
-                #     depth_scale=1,
-                #     convert_rgb_to_intensity=False,
-                # )
-                # T_CW = np.linalg.inv(twc_np)
-                # # input image pc
-                # input_pc = open3d.geometry.PointCloud.create_from_rgbd_image(
-                #     image=rgbd,
-                #     intrinsic=intrinsic_open3d,
-                #     extrinsic=T_CW)
-                # input_pc.points = open3d.utility.Vector3dVector(np.array(input_pc.points) - obj_k.obj_center.cpu().numpy())
-                # open3d.visualization.draw_geometries([pc, input_pc])
 
 
         ####################################################
@@ -258,6 +283,8 @@ if __name__ == "__main__":
             Batch_N_depth_mask = torch.stack(Batch_N_depth_mask).to(cfg.training_device)
             Batch_N_obj_mask = torch.stack(Batch_N_obj_mask).to(cfg.training_device)
             Batch_N_sampled_z = torch.stack(Batch_N_sampled_z).to(cfg.training_device)
+            
+            # If the configuration is set to process the background, move the background data to the GPU as well
             if cfg.do_bg:
                 bg_input_pcs = bg_input_pcs.to(cfg.training_device)
                 bg_gt_depth = bg_gt_depth.to(cfg.training_device)
@@ -266,15 +293,21 @@ if __name__ == "__main__":
                 bg_obj_mask = bg_obj_mask.to(cfg.training_device)
                 bg_sampled_z = bg_sampled_z.to(cfg.training_device)
 
+        # Begin the training process for each object, measuring the performance of this operation
         with performance_measure(f"Training over {len(obj_dict.keys())} objects,"):
             for iter_step in range(cfg.n_iter_per_frame):
+                # Slice the data for this iteration step
                 data_idx = slice(iter_step*n_sample_per_step, (iter_step+1)*n_sample_per_step)
+                
+                # Separate the data into different batches for this iteration step
                 batch_input_pcs = Batch_N_input_pcs[:, data_idx, ...]
                 batch_gt_depth = Batch_N_gt_depth[:, data_idx, ...]
                 batch_gt_rgb = Batch_N_gt_rgb[:, data_idx, ...]
                 batch_depth_mask = Batch_N_depth_mask[:, data_idx, ...]
                 batch_obj_mask = Batch_N_obj_mask[:, data_idx, ...]
                 batch_sampled_z = Batch_N_sampled_z[:, data_idx, ...]
+                
+                # If the training strategy is "forloop", perform a for loop training
                 if cfg.training_strategy == "forloop":
                     # for loop training
                     batch_alpha = []
@@ -288,6 +321,8 @@ if __name__ == "__main__":
 
                     batch_alpha = torch.stack(batch_alpha)
                     batch_color = torch.stack(batch_color)
+                    
+                # If the training strategy is "vmap", perform vectorized training
                 elif cfg.training_strategy == "vmap":
                     # batched training
                     batch_embedding = vmap(pe_model)(pe_param, pe_buffer, batch_input_pcs)
@@ -299,7 +334,8 @@ if __name__ == "__main__":
 
 
             # step loss
-            # with performance_measure(f"Batch LOSS"):
+            # Compute the batch loss for objects and background
+            with performance_measure(f"Batch LOSS"):
                 batch_loss, _ = loss.step_batch_loss(batch_alpha, batch_color,
                                      batch_gt_depth.detach(), batch_gt_rgb.detach(),
                                      batch_obj_mask.detach(), batch_depth_mask.detach(),
@@ -315,7 +351,7 @@ if __name__ == "__main__":
                                                      bg_sampled_z[None, bg_data_idx, ...].detach())
                     batch_loss += bg_loss
 
-            # with performance_measure(f"Backward"):
+            with performance_measure(f"Backward"):
                 if AMP:
                     scaler.scale(batch_loss).backward()
                     scaler.step(optimiser)
@@ -326,7 +362,7 @@ if __name__ == "__main__":
                 optimiser.zero_grad(set_to_none=True)
                 # print("loss ", batch_loss.item())
 
-        # update each origin model params
+        # Update each origin model parameters
         # todo find a better way    # https://github.com/pytorch/functorch/issues/280
         with performance_measure(f"updating vmap param"):
             if cfg.training_strategy == "vmap":
@@ -339,7 +375,7 @@ if __name__ == "__main__":
 
 
         ####################################################################
-        # live vis mesh
+        # Live visualization and saving checkpoints
         if (((frame_id % cfg.n_vis_iter) == 0 or frame_id == dataset_len-1) or
             (cfg.live_mode and time.time()-last_frame_time>cfg.keep_live_time)) and frame_id >= 10:
             vis3d.clear_geometries()
@@ -374,6 +410,7 @@ if __name__ == "__main__":
             view_ctl.convert_from_pinhole_camera_parameters(cam)
             vis3d.poll_events()
             vis3d.update_renderer()
+
 
         with performance_measure("saving ckpt"):
             if save_ckpt and ((((frame_id % cfg.n_vis_iter) == 0 or frame_id == dataset_len - 1) or

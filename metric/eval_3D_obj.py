@@ -7,25 +7,55 @@ import json
 
 def calc_3d_metric(mesh_rec, mesh_gt, N=200000):
     """
-    3D reconstruction metric.
+    3D reconstruction metric. This function calculates metrics to evaluate the accuracy 
+    of a reconstructed 3D mesh compared to the ground truth 3D mesh.
+
+    Parameters:
+    mesh_rec (trimesh.base.Trimesh): Reconstructed mesh object
+    mesh_gt (trimesh.base.Trimesh): Ground truth mesh object
+    N (int): Number of points to be sampled from the surface of the 3D meshes. 
+             Default is 200000.
+
+    Returns:
+    metrics (list): A list of metric values that include accuracy, completion, 
+                    and two completion ratios.
     """
+
+    # Initialize the metrics list.
     metrics = [[] for _ in range(4)]
+
+    # Calculate the oriented bounding box for the ground truth mesh.
     transform, extents = trimesh.bounds.oriented_bounds(mesh_gt)
-    extents = extents / 0.9  # enlarge 0.9
+
+    # Enlarge the bounding box by dividing extents by 0.9.
+    extents = extents / 0.9  
+
+    # Create a box mesh using the enlarged extents and the inverse of the transform matrix.
     box = trimesh.creation.box(extents=extents, transform=np.linalg.inv(transform))
+
+    # Slice the reconstructed mesh using the box mesh.
     mesh_rec = mesh_rec.slice_plane(box.facets_origin, -box.facets_normal)
+
+    # If there's no mesh found, return.
     if mesh_rec.vertices.shape[0] == 0:
         print("no mesh found")
         return
-    rec_pc = trimesh.sample.sample_surface(mesh_rec, N)
-    rec_pc_tri = trimesh.PointCloud(vertices=rec_pc[0])
 
+    # Sample N points from the surface of the reconstructed and ground truth meshes. (???)
+    rec_pc = trimesh.sample.sample_surface(mesh_rec, N)
     gt_pc = trimesh.sample.sample_surface(mesh_gt, N)
+
+    # Convert sampled points to point clouds.
+    rec_pc_tri = trimesh.PointCloud(vertices=rec_pc[0])
     gt_pc_tri = trimesh.PointCloud(vertices=gt_pc[0])
+
+    # Calculate accuracy, completion and completion ratios.
     accuracy_rec = accuracy(gt_pc_tri.vertices, rec_pc_tri.vertices)
     completion_rec = completion(gt_pc_tri.vertices, rec_pc_tri.vertices)
     completion_ratio_rec = completion_ratio(gt_pc_tri.vertices, rec_pc_tri.vertices, 0.05)
     completion_ratio_rec_1 = completion_ratio(gt_pc_tri.vertices, rec_pc_tri.vertices, 0.01)
+
+    # Append metrics to the list.
 
     # accuracy_rec *= 100  # convert to cm
     # completion_rec *= 100  # convert to cm
@@ -67,10 +97,12 @@ def get_obj_ids(obj_dir):
 
 if __name__ == "__main__":
     background_cls_list = [5, 12, 30, 31, 40, 60, 92, 93, 95, 97, 98, 79]
-    exp_name = ["room0", "room1", "room2", "office0", "office1", "office2", "office3", "office4"]
-    data_dir = "/home/xin/data/vmap/"
-    log_dir = "../logs/iMAP/"
-    # log_dir = "../logs/vMAP/"
+    # exp_name = ["room0", "room1", "room2", "office0", "office1", "office2", "office3", "office4"]
+    exp_name = ["room0"]
+    
+    data_dir = "data"
+    # log_dir = "logs/iMAP/"
+    log_dir = "logs/vMAP/"
 
     for exp in tqdm(exp_name):
         gt_dir = os.path.join(data_dir, exp[:-1]+"_"+exp[-1]+"/habitat")

@@ -1,0 +1,4 @@
+trimesh
+opencv-python
+imgviz
+shapely

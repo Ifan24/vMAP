@@ -34,10 +34,12 @@ def calc_3d_metric(mesh_rec, mesh_gt, N=200000):
 
 
 if __name__ == "__main__":
-    exp_name = ["room0", "room1", "room2", "office0", "office1", "office2", "office3", "office4"]
-    data_dir = "/home/xin/data/vmap/"
+    # exp_name = ["room0", "room1", "room2", "office0", "office1", "office2", "office3", "office4"]
+    exp_name = ["room0"]
+    
+    data_dir = "data"
     # log_dir = "../logs/iMAP/"
-    log_dir = "../logs/vMAP/"
+    log_dir = "logs/vMAP/"
 
     for exp in tqdm(exp_name):
         gt_dir = os.path.join(data_dir, exp[:-1]+"_"+exp[-1]+"/habitat")

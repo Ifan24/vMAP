@@ -99,6 +99,14 @@ def get_latest_queue(q):
 
 # for association/tracking
 class InstData:
+    # This is a class for storing information about an instance (object) in the scene. 
+    # It includes the 3D bounding box of the object (bbox3D), 
+    # the instance ID (inst_id), 
+    # the class ID (class_id), 
+    # a point cloud sample of the object (pc_sample), 
+    # and counters for merge operations (merge_cnt) 
+    # and comparison operations (cmp_cnt).
+    
     def __init__(self):
         super(InstData, self).__init__()
         self.bbox3D = None
@@ -111,28 +119,63 @@ class InstData:
 
 def box_filter(masks, classes, depth, inst_dict, intrinsic_open3d, T_CW, min_pixels=500, voxel_size=0.01):
     bbox3d_scale = 1.0  # 1.05
+    # Initialize an array for storing instance data.
     inst_data = np.zeros_like(depth, dtype=np.int)
+    
+    # Loop through each mask, which corresponds to an object in the scene.
     for i in range(len(masks)):
+        # store the mask of the difference region.
         diff_mask = None
+        
+        # Get the current mask and class ID.
         inst_mask = masks[i]
         inst_id = classes[i]
+        
+        # If the class ID is 0, continue to the next iteration.
+        # because class ID 0 corresponds to the background
         if inst_id == 0:
             continue
+            
+        # Make a copy of the depth information.
         inst_depth = np.copy(depth)
+        
+        # For the current instance mask, set depth values of non-masked regions to 0.
         inst_depth[~inst_mask] = 0.  # inst_mask
         # proj_time = time.time()
+        
+        # Project the depth information of the current instance to a point cloud.
         inst_pc = unproject_pointcloud(inst_depth, intrinsic_open3d, T_CW)
         # print("proj time ", time.time()-proj_time)
+        
+        # If the point cloud has fewer than 10 points, it is considered too small.
+        # Set instance data for the current mask to background
         if len(inst_pc.points) <= 10:  # too small
             inst_data[inst_mask] = 0  # set to background
             continue
+        
+        # If the current instance ID exists in the previous instance dictionary.    
+        # i) Semantic Consistency: 
+        # the object in the current frame is predicted as the same semantic class from the previous frame, and 
+        
         if inst_id in inst_dict.keys():
+            
+            # Get the candidate instance from the dictionary.
             candidate_inst = inst_dict[inst_id]
             # iou_time = time.time()
+            
+            # Calculate the intersection over union (IoU) and the indices of points inside the bounding box.
+            # ii) Spatial Consistency: 
+            # the object in the current frame is spatially close to the object in the previous frames, 
+            # measured by the mean IoU of their 3D object bounds.
+            
             IoU, indices = check_inside_ratio(inst_pc, candidate_inst.bbox3D)
+            print(f"IoU: {IoU}")
+            
             # print("iou time ", time.time()-iou_time)
-            # if indices empty
+            # Increment the comparison counter for the candidate instance.
             candidate_inst.cmp_cnt += 1
+            
+            # If there are one or more points inside the bounding box.
             if len(indices) >= 1:
                 candidate_inst.pc += inst_pc.select_by_index(indices)  # only merge pcs inside scale*bbox
                 # todo check indices follow valid depth
@@ -155,17 +198,25 @@ def box_filter(masks, classes, depth, inst_dict, intrinsic_open3d, T_CW, min_pix
                 diff_mask[(inst_depth != 0) & (~valid_mask)] = True
                 # cv2.imshow("diff_mask", diff_mask.astype(np.uint8) * 255)
                 # cv2.waitKey(1)
+                
+            # If there are no points inside the bounding box.
             else:   # merge all for scannet
                 # print("too few pcs obj ", inst_id)
+                
+                # set to -1 to indicate that the instance is not valid
                 inst_data[inst_mask] = -1
                 continue
+                
             # downsample_time = time.time()
             # adapt_voxel_size = np.maximum(np.max(candidate_inst.bbox3D.extent)/100, 0.1)
             candidate_inst.pc = candidate_inst.pc.voxel_down_sample(voxel_size) # adapt_voxel_size
             # candidate_inst.pc = candidate_inst.pc.farthest_point_down_sample(500)
             # candidate_inst.pc = candidate_inst.pc.random_down_sample(np.minimum(len(candidate_inst.pc.points)/500.,1))
+            
             # print("downsample time ", time.time() - downsample_time)  # 0.03s even
             # bbox_time = time.time()
+            
+            
             try:
                 candidate_inst.bbox3D = open3d.geometry.OrientedBoundingBox.create_from_points(candidate_inst.pc.points)
             except RuntimeError:
@@ -174,18 +225,32 @@ def box_filter(masks, classes, depth, inst_dict, intrinsic_open3d, T_CW, min_pix
                 continue
             # enlarge
             candidate_inst.bbox3D.scale(bbox3d_scale, candidate_inst.bbox3D.get_center())
+        
+        # If the current instance ID does not exist in the instance dictionary.
         else:   # new inst
             # init new inst and new sem
             new_inst = InstData()
             new_inst.inst_id = inst_id
+            # erode to get a smaller mask (why? TODO: show the effect of this)
+            # noise removal?
+            # reduce the effect of occlusions?
+            # remove small object
             smaller_mask = cv2.erode(inst_mask.astype(np.uint8), np.ones((5, 5)), iterations=3).astype(bool)
+            
+            # object too small
             if np.sum(smaller_mask) < min_pixels:
                 # print("too few pcs obj ", inst_id)
                 inst_data[inst_mask] = 0
                 continue
+            
+            # get pc
             inst_depth_small = depth.copy()
+            # set background to 0
             inst_depth_small[~smaller_mask] = 0
+            # Project the smaller object depth information of the current instance to a point cloud.
             inst_pc_small = unproject_pointcloud(inst_depth_small, intrinsic_open3d, T_CW)
+            
+            # init the object point cloud and bounding box.
             new_inst.pc = inst_pc_small
             new_inst.pc = new_inst.pc.voxel_down_sample(voxel_size)
             try:
@@ -194,7 +259,7 @@ def box_filter(masks, classes, depth, inst_dict, intrinsic_open3d, T_CW, min_pix
                 # print("too few pcs obj ", inst_id)
                 inst_data[inst_mask] = 0
                 continue
-            # scale up
+            # scale up (why?)
             inst_bbox3D.scale(bbox3d_scale, inst_bbox3D.get_center())
             new_inst.bbox3D = inst_bbox3D
             # update inst_dict
@@ -205,6 +270,7 @@ def box_filter(masks, classes, depth, inst_dict, intrinsic_open3d, T_CW, min_pix
         if diff_mask is not None:
             inst_data[diff_mask] = -1  # unsure area
 
+    # Return the instance data after all masks have been processed.
     return inst_data
 
 def load_matrix_from_txt(path, shape=(4, 4)):
