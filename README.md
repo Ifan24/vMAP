@@ -30,7 +30,7 @@ vMAP builds an object-level map from a real-time RGB-D input stream. Each object
 <br>
 
 We provide the implementation of the following neural-field SLAM frameworks:
-- **vMAP** [Official Implementation] 
+- **[vMAP](https://github.com/kxhit/vMAP)** [Official Implementation] 
 - **iMAP** [Simplified and Improved Re-Implementation, with depth guided sampling]
 
 
